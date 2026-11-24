@@ -1,4 +1,4 @@
-name: 编译 dsh-Go 未签名 IPA（含本机引擎）
+name: 编译 dsh-Go 未签名 IPA（含本机引擎 + 手机操控）
 
 on:
   workflow_dispatch:
@@ -9,13 +9,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: ios-ipa-${{ github.ref }}
-  cancel-in-progress: true
+  group: ios-ipa
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: macos-26
-    timeout-minutes: 200
+    timeout-minutes: 220
     env:
       FLUTTER_VERSION: 3.47.7
       FLUTTER_SHA256: dd9da574c3168460550117eb0e8dd0313ae934fabf64a82a6d557fff5fd1422e
@@ -24,7 +24,6 @@ jobs:
 
       - name: select xcode
         run: |
-          set -eux
           sw_vers
           if [ ! -d /Applications/Xcode_26.6.app ]; then
             pick="$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)"
@@ -33,7 +32,6 @@ jobs:
             echo "DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer" >> "$GITHUB_ENV"
           fi
           /usr/bin/xcodebuild -version || true
-          df -h /
 
       - name: flutter
         run: |
@@ -57,8 +55,8 @@ jobs:
 
       - name: ish tools
         run: |
-          set -eux
-          brew install llvm lld || true
+          set -euxo pipefail
+          brew install llvm lld
           python3 -m venv "$RUNNER_TEMP/ish-tools"
           "$RUNNER_TEMP/ish-tools/bin/pip" install -q meson==1.7.2 ninja==1.11.1.4
           echo "$RUNNER_TEMP/ish-tools/bin" >> "$GITHUB_PATH"
@@ -71,7 +69,15 @@ jobs:
           set -eux
           python3 --version
           bash tooling/ios/prepare-engine.sh
-          ls -la app/ios/Engine | head -20
+          ls app/ios/Engine | head -20
+
+      - name: phone self runner native
+        run: |
+          set -eux
+          export PATH="$HOME/.cargo/bin:$PATH"
+          bash tooling/ios/build-phone-self-runner.sh
+          ls app/ios/PhoneSelfRunnerNative/PhoneSelfRunner.xcconfig
+          grep -c . app/ios/PhoneSelfRunnerNative/PhoneSelfRunner.xcconfig
 
       - name: deps
         run: |
@@ -90,18 +96,22 @@ jobs:
           export PATH="$RUNNER_TEMP/flutter/bin:$HOME/.cargo/bin:$PATH"
           bash ../tooling/ios/build.sh --release --no-codesign
 
-      - name: package ipa
+      - name: verify and package
         run: |
           set -eux
           APP=app/build/ios/iphoneos/Runner.app
           test -d "$APP"
-          du -sh "$APP"
-          ls "$APP/Frameworks" || true
+          ls "$APP/Frameworks"
+          for n in NodeMobile DshNodeHost DshFlock DshRequireBuiltin DshGuest DshGuestBridge; do
+            test -e "$APP/Frameworks/$n.framework/$n" || echo "::warning::$n.framework missing"
+          done
+          strings "$APP/Runner" | grep -Fq 'dsh-phone-core:1' && echo "phone runner linked" || echo "::warning::phone runner identity not found"
+          test -d "$APP/PhoneSelfRunnerNotices" && ls "$APP/PhoneSelfRunnerNotices" || echo "::warning::phone notices missing"
           mkdir -p "$RUNNER_TEMP/ipa/Payload"
           cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
           (cd "$RUNNER_TEMP/ipa" && /usr/bin/ditto -c -k --keepParent Payload "$RUNNER_TEMP/dsh-Go-1.3.0-ios-unsigned.ipa")
-          ls -lh "$RUNNER_TEMP/dsh-Go-1.3.0-ios-unsigned.ipa"
           cp "$RUNNER_TEMP/dsh-Go-1.3.0-ios-unsigned.ipa" ./dsh-Go-1.3.0-ios-unsigned.ipa
+          ls -lh dsh-Go-1.3.0-ios-unsigned.ipa
 
       - name: upload artifact
         uses: actions/upload-artifact@v4
@@ -115,7 +125,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ios-pairing-fix
-          name: dsh-Go 1.3.0 iOS pairing fix unsigned IPA
-          body: 'unsigned IPA: sideload with Sideloadly/AltStore/ESign'
+          name: dsh-Go 1.3.0 iOS 27 pairing fix (unsigned IPA)
+          body: 'unsigned IPA: sideload with Sideloadly / AltStore / ESign'
           files: dsh-Go-1.3.0-ios-unsigned.ipa
           fail_on_unmatched_files: true
+
+      - name: keep build log on failure
+        if: failure()
+        run: |
+          find . -name '*.log' -newermt '-2 hours' | head -5 | while read -r f; do echo "=== $f ==="; tail -n 40 "$f"; done

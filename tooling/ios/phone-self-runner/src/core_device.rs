@@ -201,7 +201,16 @@ impl Input {
     fn timeout(&self) -> Duration {
         // Explicit prepareInput negotiates the owned audio/video gate. ASCII
         // also has a longer, still bounded deadline for its validated sequence.
-        Duration::from_secs(if matches!(self, Self::PrepareInput) || self.frame_id().is_some() { 90 } else { 30 })
+        // The app service handshake is the slowest non-media RPC on a device
+        // that has just started streaming; it gets its own budget so a slow
+        // answer is not reported as a missing one.
+        let secs = match self {
+            Self::PrepareInput => 90,
+            Self::Apps | Self::Launch { .. } => 60,
+            Self::Screenshot => 30,
+            _ => 90,
+        };
+        Duration::from_secs(secs)
     }
 }
 
@@ -696,11 +705,16 @@ struct Session {
     keyboard_unknown: bool,
     touch: Option<TouchLease>,
     home: Option<IndigoHidClient<Box<dyn ReadWrite>>>,
+    // The application catalog read while the tunnel was still quiet. Asking the
+    // app service after the display stream has taken the tunnel over is what
+    // used to time out, and a catalog changes rarely enough that one read at
+    // start is the honest answer for a session.
+    apps_catalog: Option<Vec<u8>>,
 }
 impl Session {
     fn new(tunnel: Tunnel) -> Self {
         Self { tunnel, frame: None, media: media::OwnedMedia::new(), keyboard: None,
-            keyboard_unknown: false, touch: None, home: None }
+            keyboard_unknown: false, touch: None, home: None, apps_catalog: None }
     }
     async fn orientation(&mut self) -> Result<u8, Failure> {
         let mut client = SpringBoardServicesClient::connect_rsd(&mut self.tunnel.adapter, &mut self.tunnel.handshake).await.map_err(|_| SERVICE)?;
@@ -724,7 +738,21 @@ impl Session {
             let mut client = self.dvt().await?;
             ScreenshotClient::new(&mut client).await.map_err(|_| SERVICE)?;
         } else { return Err(SERVICE); }
-        AppServiceClient::connect_rsd(&mut self.tunnel.adapter, &mut self.tunnel.handshake).await.map_err(|_| SERVICE)?;
+        // Establish the app service and read its catalog now: this runs before
+        // any display stream is active, which is the only window where the
+        // handshake is reliably short.
+        let mut catalog = AppServiceClient::connect_rsd(&mut self.tunnel.adapter, &mut self.tunnel.handshake).await.map_err(|_| SERVICE)?;
+        // Best effort and explicitly bounded: the whole probe has a thirty
+        // second budget, so a slow inventory must not decide whether the
+        // session comes up. apps() falls back to asking again at request time.
+        if let Ok(Ok(apps)) = tokio::time::timeout(
+            Duration::from_secs(8),
+            catalog.list_apps(false, true, false, false, true),
+        ).await {
+            if let Ok(bytes) = application_catalog(apps.into_iter().map(|app| (app.name, app.bundle_identifier))) {
+                self.apps_catalog = Some(bytes);
+            }
+        }
         let input = if self.tunnel.handshake.services.contains_key(HID) && self.tunnel.handshake.services.contains_key(DISPLAY) {
             let probe = async {
                 let mut hid = UniversalHidServiceClient::connect_rsd(&mut self.tunnel.adapter, &mut self.tunnel.handshake).await.map_err(|_| SERVICE)?;
@@ -877,9 +905,13 @@ impl Session {
         Ok(client)
     }
     async fn apps(&mut self) -> Result<Payload, Failure> {
+        if let Some(bytes) = &self.apps_catalog {
+            return Ok(Payload::read("apps", "application/json", bytes.clone()));
+        }
         let mut client = AppServiceClient::connect_rsd(&mut self.tunnel.adapter, &mut self.tunnel.handshake).await.map_err(|_| SERVICE)?;
         let apps = client.list_apps(false, true, false, false, true).await.map_err(|_| SERVICE)?;
         let bytes = application_catalog(apps.into_iter().map(|app| (app.name, app.bundle_identifier)))?;
+        self.apps_catalog = Some(bytes.clone());
         Ok(Payload::read("apps", "application/json", bytes))
     }
     async fn create_keyboard(&mut self, acted: &AtomicBool, frame: &Frame, id: &str) -> Result<(), Failure> {

@@ -256,7 +256,13 @@ final class IOSPhoneCoreDevice: NSObject {
       if run.pending === pending { run.pending = nil }
       return .failure(.init(code: Self.acceptanceCode(accepted)))
     }
-    let deadline = now().addingTimeInterval(["ascii", "prepareInput"].contains(operation) ? 110 : 35)
+    // The app service gets its own budget: its handshake is asked while a
+    // display stream may already own the tunnel, and the runner allows sixty
+    // seconds for it. Waiting less here would report a slow answer as a
+    // missing one, which is exactly what the app catalog used to look like.
+    let appService = ["apps", "launch", "open", "activate"].contains(operation)
+    let deadline = now().addingTimeInterval(
+      ["ascii", "prepareInput"].contains(operation) ? 110 : (appService ? 70 : 35))
     while true {
       guard !Task.isCancelled, current(), active === run, !run.stopping,
         !run.terminal, !run.faulted, run.pairingGeneration == pairing.generation,
